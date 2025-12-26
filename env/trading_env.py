@@ -3,146 +3,205 @@ import numpy as np
 import torch
 from gym import spaces
 
+
 class TradingEnv(gym.Env):
+    metadata = {"render_modes": []}
 
     def __init__(
         self,
         windows_tensor,
         encoder,
-        initial_balance = 10000,
-        transaction_cost = 0.0005,
+        initial_balance=10000,
+        transaction_cost=0.0005,
+        lambda_dd=0.001,
     ):
         super().__init__()
 
         self.windows = windows_tensor
         self.encoder = encoder
+
         self.initial_balance = initial_balance
         self.transaction_cost = transaction_cost
-        self.peak_value = initial_balance
+        self.lambda_dd = lambda_dd
+
+        # Trading state
         self.current_step = 0
         self.balance = initial_balance
+        self.peak_value = initial_balance
         self.positions = 0
         self.entry_price = 0.0
 
-        self.action_space = spaces.Discrete(3)  # 0: Hold, 1: Buy, 2: Sell
+        # Structural fixes
+        self.min_hold_steps = 10
+        self.hold_counter = 0
 
+        # Regime-specific risk aversion
+        self.REGIME_LAMBDA = {
+            "trending": 0.0003,
+            "sideways": 0.001,
+            "volatile": 0.003,
+        }
+
+        # Spaces
+        self.action_space = spaces.Discrete(3)  # HOLD, BUY, SELL
         self.state_dim = 128
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(self.state_dim,),
-            dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32
         )
 
+    # ---------------------------------------------------
+    # RESET
+    # ---------------------------------------------------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
         self.current_step = 0
         self.balance = self.initial_balance
+        self.peak_value = self.initial_balance
         self.positions = 0
         self.entry_price = 0.0
-        self.peak_value = self.initial_balance
+        self.hold_counter = 0
 
         obs = self._get_state()
-        self.last_obs = obs
-        info = {}
+        return obs, {}
 
-        return obs, info
-
-
+    # ---------------------------------------------------
+    # STEP
+    # ---------------------------------------------------
     def step(self, action):
+        reward = 0.0
         terminated = False
         truncated = False
 
-    # =====================================================
-    # 1. TERMINATION GUARD (MUST BE FIRST)
-    # =====================================================
-        if self.current_step >= len(self.windows) - 1:
-            terminated = True
+        # Terminal guard
+        if self.current_step >= len(self.windows) - 2:
+            return self._get_state(), 0.0, True, False, {}
 
-    # Force liquidation if holding
-            if self.positions == 1:
-                final_price = self._get_price(self.current_step)
-                self.balance += final_price
-                self.positions = 0
-
-            final_value = self.balance
-            reward = final_value - self.peak_value  # final settlement reward
-
-            return self.last_obs, reward, terminated, truncated, {}
-    
-    # =====================================================
-    # 2. ACTION MASKING (CRITICAL FIX)
-    # =====================================================
-    # Cannot SELL if no position
-        if self.positions == 0 and action == 2:
+        # Enforce valid actions
+        if not self._is_action_valid(action):
             action = 0  # HOLD
 
-    # Cannot BUY if already holding
-        if self.positions == 1 and action == 1:
-            action = 0  # HOLD
-
-    # =====================================================
-    # 3. CURRENT PRICE & PORTFOLIO VALUE
-    # =====================================================
         curr_price = self._get_price(self.current_step)
-        prev_value = self.balance + self.positions * curr_price
+        next_price = self._get_price(self.current_step + 1)
 
-    # =====================================================
-    # 4. EXECUTE ACTION (ONLY IF VALID)
-    # =====================================================
-        if action == 1 and self.positions == 0:  # BUY
+        # ---------------------------------------------------
+        # ACTION LOGIC
+        # ---------------------------------------------------
+        # BUY
+        if action == 1 and self.positions == 0:
             self.positions = 1
             self.entry_price = curr_price
-            self.balance -= self.transaction_cost
+            self.hold_counter = 0
+            reward -= self.transaction_cost
 
-        elif action == 2 and self.positions == 1:  # SELL
-            self.positions = 0
-            self.entry_price = 0.0
-            self.balance -= self.transaction_cost
+        # SELL
+        elif action == 2 and self.positions == 1:
+            if self.hold_counter >= self.min_hold_steps:
+                pnl = curr_price - self.entry_price
+                self.balance += pnl
+                reward += pnl
+                reward -= self.transaction_cost
+                self.positions = 0
+                self.entry_price = 0.0
+                self.hold_counter = 0
+            else:
+                action = 0  # force HOLD
 
-    # =====================================================
-    # 5. ADVANCE TIME
-    # =====================================================
+        # HOLD
+        if action == 0:
+            reward -= 0.00001  # small inactivity drag
+
+        # ---------------------------------------------------
+        # POSITION DYNAMICS
+        # ---------------------------------------------------
+        if self.positions == 1:
+            self.hold_counter += 1
+
+            # Unrealized PnL
+            unrealized = next_price - curr_price
+            reward += unrealized
+
+            # Update peak balance
+            self.peak_value = max(self.peak_value, self.balance + unrealized)
+
+            # Regime-aware risk penalty (ONLY when exposed)
+            regime = self._detect_regime()
+            lambda_dd = self.REGIME_LAMBDA.get(regime, self.lambda_dd)
+
+            drawdown = max(0.0, self.peak_value - (self.balance + unrealized))
+            reward -= lambda_dd * drawdown
+
+            # Incentivize trend participation
+            if regime == "trending":
+                reward += 0.0005
+
+        else:
+            # Opportunity cost of staying in cash
+            reward -= 0.00005
+
+        # ---------------------------------------------------
+        # STEP FORWARD
+        # ---------------------------------------------------
         self.current_step += 1
 
-    # =====================================================
-    # 6. NEXT PRICE & CURRENT VALUE
-    # =====================================================
-        next_price = self._get_price(self.current_step)
-        curr_value = self.balance + self.positions * next_price
+        if self.current_step >= len(self.windows) - 2:
+            terminated = True
 
-    # =====================================================
-    # 7. DRAWDOWN TRACKING
-    # =====================================================
-        self.peak_value = max(self.peak_value, curr_value)
-        drawdown = self.peak_value - curr_value
-
-    # =====================================================
-    # 8. RISK-AWARE REWARD
-    # =====================================================
-        LAMBDA_DD = 0.001
-        reward = (curr_value - prev_value) - LAMBDA_DD * drawdown
-
-    # Small inactivity penalty (prevents "do nothing forever")
-        if action == 0:
-            reward -= 1e-5
-
-    # =====================================================
-    # 9. NEXT OBSERVATION (SAFE)
-    # =====================================================
         obs = self._get_state()
-        self.last_obs = obs
+        info = {
+            "balance": self.balance,
+            "position": self.positions,
+            "regime": self._detect_regime(),
+        }
 
-        return obs, reward, terminated, truncated, {}
+        return obs, reward, terminated, truncated, info
 
+    # ---------------------------------------------------
+    # STATE
+    # ---------------------------------------------------
     def _get_state(self):
         window = self.windows[self.current_step].unsqueeze(0)
         with torch.no_grad():
             state = self.encoder(window)
-        return state.squeeze(0).numpy()
-    
+        return state.squeeze(0).cpu().numpy()
+
     def _get_price(self, step):
         return self.windows[step][3, -1].item()
-    
-    
+
+    # ---------------------------------------------------
+    # REGIME DETECTION
+    # ---------------------------------------------------
+    def _detect_regime(self):
+        lookback = 20
+
+        if self.current_step < lookback + 1:
+            return "sideways"
+
+        close_prices = self.windows[
+            self.current_step - lookback : self.current_step + 1,
+            3,
+            -1,
+        ].cpu().numpy()
+
+        close_prices = np.clip(close_prices, 1e-6, None)
+        returns = np.diff(np.log(close_prices))
+
+        mean_return = np.mean(returns)
+        volatility = np.std(returns)
+
+        if volatility > 0.015:
+            return "volatile"
+        elif abs(mean_return) > 0.002:
+            return "trending"
+        else:
+            return "sideways"
+
+    # ---------------------------------------------------
+    # ACTION VALIDATION
+    # ---------------------------------------------------
+    def _is_action_valid(self, action):
+        if self.positions == 0 and action == 2:
+            return False
+        if self.positions == 1 and action == 1:
+            return False
+        return True
